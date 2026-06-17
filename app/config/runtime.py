@@ -7,5 +7,8 @@ allowed_ids: set[int] = set(settings.initial_allowed_ids)
 if settings.admin_user_id:
     allowed_ids.add(settings.admin_user_id)
 
-# Current API key (modifiable at runtime)
+# Current OpenAI API key (modifiable at runtime) — эмбеддинги, Whisper, vision
 api_key: str = settings.openai_api_key
+
+# RouterAI API key (modifiable at runtime) — Claude для обработки текста
+routerai_key: str = settings.routerai_api_key

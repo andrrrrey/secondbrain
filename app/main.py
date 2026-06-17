@@ -8,6 +8,7 @@ from app.bot.handlers import router, set_bot_commands
 from app.bot.middleware import AccessMiddleware
 from app.config import settings
 from app.db import postgres, qdrant
+from app.services.scheduler import run_scheduler
 
 logging.basicConfig(
     level=logging.INFO,
@@ -20,6 +21,7 @@ async def on_startup(bot: Bot) -> None:
     await postgres.init_tables()
     qdrant.init_collection()
     await set_bot_commands(bot)
+    asyncio.create_task(run_scheduler(bot))
     logger.info("Startup complete")
 
 

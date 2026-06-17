@@ -7,12 +7,18 @@ class Settings(BaseSettings):
     allowed_user_ids: str = ""
     admin_user_id: int = 0
 
-    # OpenAI
+    # OpenAI (эмбеддинги, Whisper, анализ изображений)
     openai_api_key: str
     openai_base_url: str = "https://api.openai.com/v1"
     llm_model: str = "gpt-4o-mini"
     embedding_model: str = "text-embedding-3-small"
     whisper_model: str = "whisper-1"
+    vision_model: str = "gpt-4o-mini"
+
+    # RouterAI (Claude для обработки текста)
+    routerai_api_key: str = ""
+    routerai_base_url: str = "https://routerai.ru/api/v1"
+    text_model: str = "anthropic/claude-opus-4.8-fast"
 
     # PostgreSQL
     postgres_host: str = "postgres"

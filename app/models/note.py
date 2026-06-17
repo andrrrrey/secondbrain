@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 class NoteType(StrEnum):
     TEXT = "text"
     VOICE = "voice"
+    IMAGE = "image"
 
 
 class Note(BaseModel):
