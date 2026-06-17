@@ -139,10 +139,13 @@ def kb_after_save() -> InlineKeyboardMarkup:
 
 
 def kb_after_search() -> InlineKeyboardMarkup:
-    """After search result."""
+    """After search/AI result."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="➕ Добавить заметку", callback_data="add_more"),
+            InlineKeyboardButton(text="💾 Сохранить ответ как заметку", callback_data="save_answer"),
+        ],
+        [
+            InlineKeyboardButton(text="➕ Новая заметка", callback_data="add_more"),
             InlineKeyboardButton(text="🔍 Найти ещё", callback_data="do_search_fresh"),
         ],
         [
@@ -582,6 +585,39 @@ async def cb_ask_ai(callback: CallbackQuery) -> None:
     except Exception:
         logger.exception("Ask AI error")
         await callback.message.answer("⚠️ Ошибка при обращении к ИИ.", reply_markup=kb_home())
+
+
+@router.callback_query(F.data == "save_answer")
+async def cb_save_answer(callback: CallbackQuery) -> None:
+    """Сохранить последний ответ ИИ/поиска как заметку."""
+    user_id = callback.from_user.id
+    answer = _last_bot_message.get(user_id)
+    if not answer:
+        await callback.answer("Нет ответа для сохранения.")
+        return
+
+    await callback.answer()
+    await callback.message.edit_reply_markup(reply_markup=None)
+
+    try:
+        note, reminders = await process_and_save_note(
+            user_id=user_id, text=answer, note_type=NoteType.TEXT,
+        )
+        tags_str = ", ".join(f"#{t}" for t in note.tags) if note.tags else "—"
+        rem_line = (
+            f"\n⏰ Поставил напоминаний: {reminders} (напомню за сутки)"
+            if reminders else ""
+        )
+        await callback.message.answer(
+            f"✅ Ответ сохранён в заметки!\n\n"
+            f"📋 {note.summary}\n"
+            f"🏷 {tags_str}"
+            f"{rem_line}",
+            reply_markup=kb_after_save(),
+        )
+    except Exception:
+        logger.exception("Error saving AI answer")
+        await callback.message.answer("⚠️ Ошибка при сохранении.", reply_markup=kb_home())
 
 
 @router.callback_query(F.data == "add_more")
