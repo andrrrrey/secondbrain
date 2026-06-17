@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from app.db import postgres, qdrant
 from app.models import SearchResult
@@ -13,6 +13,7 @@ from app.services.llm import (
     get_embedding,
     parse_time_filter,
 )
+from app.services.timezones import get_tz
 
 logger = logging.getLogger(__name__)
 
@@ -88,10 +89,17 @@ async def _get_relevant_context(user_id: int, query: str) -> list[dict]:
     ]
     results.sort(key=lambda r: r.score, reverse=True)
 
+    tz = await get_tz(user_id)
+
+    def _fmt(dt) -> str:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M")
+
     return [
         {
             "full_text": r.note.full_text,
-            "created_at": r.note.created_at.astimezone(timezone(timedelta(hours=3))).strftime("%Y-%m-%d %H:%M") if r.note.created_at.tzinfo else (r.note.created_at + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M"),
+            "created_at": _fmt(r.note.created_at),
             "tags": r.note.tags,
         }
         for r in results

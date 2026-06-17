@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import logging
 
@@ -10,7 +11,10 @@ import app.config.runtime as rt
 
 logger = logging.getLogger(__name__)
 
+# OpenAI-клиент: эмбеддинги, Whisper, анализ изображений (vision)
 _client: AsyncOpenAI | None = None
+# RouterAI-клиент: Claude для обработки текста
+_text_client: AsyncOpenAI | None = None
 
 
 def get_openai() -> AsyncOpenAI:
@@ -23,10 +27,32 @@ def get_openai() -> AsyncOpenAI:
     return _client
 
 
+def get_text_client() -> AsyncOpenAI:
+    """Клиент для обработки текста через Claude (routerai.ru).
+
+    Если ключ routerai не задан — откатываемся на OpenAI-клиент,
+    чтобы бот оставался работоспособным."""
+    global _text_client
+    if not rt.routerai_key:
+        return get_openai()
+    if _text_client is None:
+        _text_client = AsyncOpenAI(
+            api_key=rt.routerai_key,
+            base_url=settings.routerai_base_url,
+        )
+    return _text_client
+
+
+def _text_model() -> str:
+    """Модель для текстовых задач: Claude, либо fallback на OpenAI-модель."""
+    return settings.text_model if rt.routerai_key else settings.llm_model
+
+
 def reset_openai_client() -> None:
-    """Reset client so it picks up a new API key."""
-    global _client
+    """Reset clients so they pick up new API keys."""
+    global _client, _text_client
     _client = None
+    _text_client = None
 
 
 async def get_embedding(text: str) -> list[float]:
@@ -40,9 +66,9 @@ async def get_embedding(text: str) -> list[float]:
 
 async def summarize_and_tag(text: str) -> tuple[str, list[str]]:
     """Return (summary, tags) for a note text."""
-    client = get_openai()
+    client = get_text_client()
     resp = await client.chat.completions.create(
-        model=settings.llm_model,
+        model=_text_model(),
         temperature=0,
         messages=[
             {
@@ -85,9 +111,9 @@ async def generate_answer(query: str, context_notes: list[dict]) -> str:
 
     context = "\n---\n".join(context_parts)
 
-    client = get_openai()
+    client = get_text_client()
     resp = await client.chat.completions.create(
-        model=settings.llm_model,
+        model=_text_model(),
         temperature=0,
         messages=[
             {
@@ -162,9 +188,9 @@ async def ask_ai_with_context(
 
     messages.append({"role": "user", "content": user_content})
 
-    client = get_openai()
+    client = get_text_client()
     resp = await client.chat.completions.create(
-        model=settings.llm_model,
+        model=_text_model(),
         temperature=0.7,
         messages=messages,
         max_completion_tokens=1500,
@@ -178,9 +204,9 @@ async def ask_ai_with_context(
 
 async def parse_time_filter(query: str) -> dict:
     """Extract time references from user query."""
-    client = get_openai()
+    client = get_text_client()
     resp = await client.chat.completions.create(
-        model=settings.llm_model,
+        model=_text_model(),
         temperature=0,
         messages=[
             {
@@ -208,9 +234,9 @@ async def parse_time_filter(query: str) -> dict:
 async def classify_followup(query: str, last_bot_message: str) -> bool:
     """Determine if user's query is a follow-up to the last bot message
     or a standalone new question."""
-    client = get_openai()
+    client = get_text_client()
     resp = await client.chat.completions.create(
-        model=settings.llm_model,
+        model=_text_model(),
         temperature=0,
         messages=[
             {
@@ -242,9 +268,9 @@ async def classify_followup(query: str, last_bot_message: str) -> bool:
 
 async def answer_followup(query: str, last_bot_message: str) -> str:
     """Answer a follow-up question using the previous bot message as context."""
-    client = get_openai()
+    client = get_text_client()
     resp = await client.chat.completions.create(
-        model=settings.llm_model,
+        model=_text_model(),
         temperature=0.7,
         messages=[
             {
@@ -264,4 +290,121 @@ async def answer_followup(query: str, last_bot_message: str) -> str:
     result = resp.choices[0].message.content
     if not result or not result.strip():
         return "ИИ не смог сформировать ответ. Попробуй переформулировать вопрос."
+    return result
+
+
+async def extract_reminders(text: str, now_local_iso: str, tz_name: str) -> list[dict]:
+    """Извлечь из текста заметки будущие события с датой/временем.
+
+    Возвращает список словарей {"title": str, "event_at": ISO-строка в местном времени}.
+    Если событий с конкретным временем нет — пустой список.
+    """
+    client = get_text_client()
+    resp = await client.chat.completions.create(
+        model=_text_model(),
+        temperature=0,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Ты извлекаешь из текста заметки запланированные события, у которых "
+                    "есть конкретная дата и/или время в будущем (встречи, дела, планы). "
+                    f"Текущее локальное время пользователя: {now_local_iso} "
+                    f"(часовой пояс {tz_name}). "
+                    "Относительные даты («завтра», «в среду в 19:00», «через 3 дня») "
+                    "переводи в абсолютные ISO-даты в местном времени пользователя. "
+                    "Верни ТОЛЬКО JSON-объект вида "
+                    '{"reminders": [{"title": "краткое описание события", '
+                    '"event_at": "YYYY-MM-DDTHH:MM"}]}. '
+                    "Если время не указано — поставь разумное (например 09:00). "
+                    "Если будущих событий нет — верни {\"reminders\": []}. "
+                    "Без markdown, только JSON."
+                ),
+            },
+            {"role": "user", "content": text},
+        ],
+        max_completion_tokens=400,
+    )
+    raw = resp.choices[0].message.content or "{}"
+    try:
+        data = json.loads(raw)
+        reminders = data.get("reminders", [])
+        if isinstance(reminders, list):
+            return [
+                r for r in reminders
+                if isinstance(r, dict) and r.get("title") and r.get("event_at")
+            ]
+    except json.JSONDecodeError:
+        logger.warning("Failed to parse reminders JSON: %s", raw)
+    return []
+
+
+async def weekly_summary(notes: list[dict]) -> str:
+    """Краткий обзор заметок за неделю: главные темы и что не забыть."""
+    if not notes:
+        return "За последнюю неделю заметок не было."
+
+    parts = []
+    for n in notes:
+        date_str = n.get("created_at", "?")
+        summary = n.get("summary") or n.get("full_text", "")
+        tags = ", ".join(n.get("tags", []))
+        parts.append(f"[{date_str}] {summary} (теги: {tags})")
+    context = "\n".join(parts)
+
+    client = get_text_client()
+    resp = await client.chat.completions.create(
+        model=_text_model(),
+        temperature=0.4,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Ты — персональный ассистент. На основе заметок пользователя за "
+                    "последнюю неделю составь краткую сводку на русском: "
+                    "1) главные темы недели, 2) о чём были заметки, "
+                    "3) что не стоит забыть / на что обратить внимание. "
+                    "Пиши дружелюбно, структурированно, без воды. "
+                    "Используй эмодзи для разделов."
+                ),
+            },
+            {"role": "user", "content": f"Мои заметки за неделю:\n{context}"},
+        ],
+        max_completion_tokens=1000,
+    )
+    return resp.choices[0].message.content or "Не удалось сформировать сводку."
+
+
+async def analyze_image(image_bytes: bytes, mime: str = "image/jpeg") -> str:
+    """Распознать текст и описать содержимое изображения (OpenAI vision)."""
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    data_url = f"data:{mime};base64,{b64}"
+
+    client = get_openai()
+    resp = await client.chat.completions.create(
+        model=settings.vision_model,
+        temperature=0,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Ты анализируешь изображения. Если на картинке есть текст — "
+                    "распознай его полностью и точно. Затем кратко опиши, что "
+                    "изображено. Отвечай на русском. Сначала текст с картинки "
+                    "(если есть), затем краткое описание."
+                ),
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Распознай и опиши это изображение."},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            },
+        ],
+        max_completion_tokens=1000,
+    )
+    result = resp.choices[0].message.content
+    if not result or not result.strip():
+        return "Не удалось распознать изображение."
     return result

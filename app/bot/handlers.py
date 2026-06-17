@@ -4,6 +4,7 @@ import logging
 import tempfile
 from datetime import timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import aiofiles
 import aiohttp
@@ -20,11 +21,13 @@ from aiogram.types import (
 )
 
 from app.db import postgres
-from app.models import NoteType
-from app.services.llm import reset_openai_client
+from app.models import NoteType, UserSettings
+from app.services.llm import analyze_image, reset_openai_client
 from app.services.notes import delete_note_full, process_and_save_note, update_existing_note
 from app.services.search import ask_ai, search_and_answer
 from app.services.stt import transcribe
+from app.services.summary import build_weekly_summary
+from app.services import timezones
 from app.config.settings import settings
 import app.config.runtime as rt
 
@@ -33,19 +36,33 @@ router = Router()
 
 NOTES_PER_PAGE = 5
 
-MSK = timezone(timedelta(hours=3))
+WEEKDAY_NAMES = [
+    "Понедельник", "Вторник", "Среда", "Четверг",
+    "Пятница", "Суббота", "Воскресенье",
+]
+
+TYPE_ICONS = {
+    NoteType.VOICE: "🎤",
+    NoteType.IMAGE: "🖼",
+    NoteType.TEXT: "📝",
+}
 
 
-def fmt_date(dt, fmt: str = "%d.%m.%Y %H:%M") -> str:
-    """Format datetime in Moscow time."""
-    if dt.tzinfo is not None:
-        return dt.astimezone(MSK).strftime(fmt)
-    return (dt + timedelta(hours=3)).strftime(fmt)
+def fmt_date(dt, tz: ZoneInfo, fmt: str = "%d.%m.%Y %H:%M") -> str:
+    """Format datetime in the user's timezone."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(tz).strftime(fmt)
+
 
 # ── FSM States ──────────────────────────────────────────────────
 
 class EditNote(StatesGroup):
     waiting_for_text = State()
+
+
+class TzStates(StatesGroup):
+    waiting_offset = State()
 
 
 class AdminStates(StatesGroup):
@@ -64,6 +81,9 @@ _last_bot_message: dict[int, str] = {}
 COMMANDS = [
     BotCommand(command="start", description="Главное меню"),
     BotCommand(command="help", description="Справка"),
+    BotCommand(command="reminders", description="Мои напоминания"),
+    BotCommand(command="summary", description="Сводка за неделю"),
+    BotCommand(command="settings", description="Настройки (пояс, сводка)"),
     BotCommand(command="admin", description="Управление ботом (админ)"),
     BotCommand(command="api", description="Сменить API-ключ (админ)"),
 ]
@@ -90,6 +110,18 @@ def kb_main_choice() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="📋 Управление заметками", callback_data="manage_menu"),
         ],
+    ])
+
+
+def kb_main_menu() -> InlineKeyboardMarkup:
+    """Главное меню с доступом к заметкам, напоминаниям, сводке и настройкам."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Управление заметками", callback_data="manage_menu")],
+        [
+            InlineKeyboardButton(text="⏰ Напоминания", callback_data="reminders"),
+            InlineKeyboardButton(text="🗓 Сводка за неделю", callback_data="do_summary"),
+        ],
+        [InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
     ])
 
 
@@ -177,12 +209,12 @@ def kb_home() -> InlineKeyboardMarkup:
     ])
 
 
-def _notes_list_kb(notes, offset: int, prefix: str = "notes_all") -> InlineKeyboardMarkup:
+def _notes_list_kb(notes, offset: int, tz: ZoneInfo, prefix: str = "notes_all") -> InlineKeyboardMarkup:
     """Build paginated notes list with note buttons."""
     buttons = []
     for n in notes:
-        date_str = fmt_date(n.created_at, "%d.%m.%Y")
-        type_icon = "🎤" if n.note_type == NoteType.VOICE else "📝"
+        date_str = fmt_date(n.created_at, tz, "%d.%m.%Y")
+        type_icon = TYPE_ICONS.get(n.note_type, "📝")
         label = f"{date_str} {type_icon} {n.summary[:40]}"
         buttons.append([InlineKeyboardButton(text=label, callback_data=f"note_actions:{n.id}")])
 
@@ -202,26 +234,127 @@ def _notes_list_kb(notes, offset: int, prefix: str = "notes_all") -> InlineKeybo
 #  /start & /help
 # ═══════════════════════════════════════════════════════════════
 
+GREETING = (
+    "👋 Привет! Я — твой второй мозг.\n\n"
+    "Вот что я умею:\n"
+    "📝 Сохраняю заметки из текста, голоса и фото\n"
+    "🔍 Ищу по смыслу в твоих заметках\n"
+    "🤖 Отвечаю на вопросы с учётом заметок\n"
+    "⏰ Сам нахожу даты и события в заметках и напоминаю за сутки\n"
+    "🗓 Раз в неделю присылаю сводку о главном\n\n"
+    "Просто отправь мне текст, голосовое или фото 👇"
+)
+
+
+def kb_timezone() -> InlineKeyboardMarkup:
+    """Клавиатура выбора часового пояса."""
+    rows = []
+    row = []
+    for iana, label in timezones.COMMON_TIMEZONES:
+        row.append(InlineKeyboardButton(text=label, callback_data=f"tz:{iana}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="✍️ Ввести смещение вручную", callback_data="tz_manual")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    _last_bot_message.pop(message.from_user.id, None)
-    await message.answer(
-        "👋 Привет! Расскажи свои мысли — я выслушаю и помогу структурировать.\n\n"
-        "Отправь текст или голосовое сообщение.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📋 Управление заметками", callback_data="manage_menu")],
-        ]),
-    )
+    user_id = message.from_user.id
+    _last_bot_message.pop(user_id, None)
+
+    settings_row = await postgres.get_user_settings(user_id)
+    if settings_row is None:
+        # Первый запуск — спрашиваем часовой пояс
+        await message.answer(
+            "👋 Привет! Прежде чем начать, выбери свой часовой пояс —\n"
+            "чтобы напоминания и сводки приходили по твоему местному времени.",
+            reply_markup=kb_timezone(),
+        )
+        return
+
+    await message.answer(GREETING, reply_markup=kb_main_menu())
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     await message.answer(
-        "📖 Как пользоваться:\n\n"
-        "1️⃣ Отправь текст или голосовое\n"
-        "2️⃣ Выбери: Запомнить или Найти в памяти\n"
-        "3️⃣ Управляй заметками через меню\n"
+        "📖 Как пользоваться\n\n"
+        "💾 *Сохранить заметку*\n"
+        "Отправь текст, голосовое или фото → нажми «✅ Запомнить».\n"
+        "Пример: «Идея: сделать лендинг для проекта».\n\n"
+        "🔍 *Найти в памяти*\n"
+        "Отправь вопрос → «🔍 Найти в памяти».\n"
+        "Пример: «что я записывал про лендинг?»\n\n"
+        "🤖 *Спросить у ИИ*\n"
+        "Отправь вопрос → «🤖 Спросить у ИИ» (ответит с учётом заметок).\n\n"
+        "⏰ *Напоминания*\n"
+        "Просто запиши мысль с датой — я напомню за сутки.\n"
+        "Пример: «хочу в театр в среду в 19:00».\n"
+        "Список и удаление — команда /reminders\n\n"
+        "🗓 *Сводка за неделю*\n"
+        "Команда /summary — обзор в любой момент.\n"
+        "День и время авто-сводки — в /settings\n\n"
+        "🌍 *Часовой пояс*\n"
+        "Сменить — в /settings",
+        parse_mode="Markdown",
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+#  TIMEZONE onboarding
+# ═══════════════════════════════════════════════════════════════
+
+async def _save_tz_and_greet(user_id: int, tz_name: str, send) -> None:
+    await postgres.set_user_timezone(user_id, tz_name)
+    timezones.invalidate_tz_cache(user_id)
+    await send(
+        f"✅ Часовой пояс сохранён: {tz_name}\n\n{GREETING}",
+        reply_markup=kb_main_menu(),
+    )
+
+
+@router.callback_query(F.data.startswith("tz:"))
+async def cb_set_tz(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.answer()
+    tz_name = callback.data.split(":", 1)[1]
+    if not timezones.is_valid_tz(tz_name):
+        await callback.message.answer("⚠️ Не удалось распознать пояс. Попробуй ещё раз.")
+        return
+    await _save_tz_and_greet(callback.from_user.id, tz_name, callback.message.answer)
+
+
+@router.callback_query(F.data == "tz_manual")
+async def cb_tz_manual(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.set_state(TzStates.waiting_offset)
+    await callback.message.answer(
+        "✍️ Отправь своё смещение от UTC, например: +3, -5, UTC+4"
+    )
+
+
+async def _finish_tz_offset(message: Message, state: FSMContext, text: str) -> None:
+    await state.clear()
+    tz_name = timezones.parse_offset(text)
+    if not tz_name or not timezones.is_valid_tz(tz_name):
+        await message.answer(
+            "⚠️ Не понял смещение. Пример: +3 или -5. Попробуй ещё раз через /timezone."
+        )
+        return
+    await _save_tz_and_greet(message.from_user.id, tz_name, message.answer)
+
+
+@router.message(Command("timezone"))
+async def cmd_timezone(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(
+        "🌍 Выбери часовой пояс:",
+        reply_markup=kb_timezone(),
     )
 
 
@@ -233,12 +366,7 @@ async def cmd_help(message: Message) -> None:
 async def cb_home(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await callback.answer()
-    await callback.message.edit_text(
-        "👋 Отправь текст или голосовое сообщение.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📋 Управление заметками", callback_data="manage_menu")],
-        ]),
-    )
+    await callback.message.edit_text(GREETING, reply_markup=kb_main_menu())
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -284,6 +412,44 @@ async def handle_voice(message: Message, bot: Bot, state: FSMContext) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  INPUT: Photo → analyze + choice
+# ═══════════════════════════════════════════════════════════════
+
+@router.message(F.photo)
+async def handle_photo(message: Message, bot: Bot, state: FSMContext) -> None:
+    current = await state.get_state()
+    if current == EditNote.waiting_for_text.state:
+        await message.answer("Сейчас жду новый текст заметки. Отправь текстом, пожалуйста.")
+        return
+
+    processing_msg = await message.answer("🖼 Анализирую изображение...")
+
+    photo = message.photo[-1]  # самое крупное
+    file = await bot.get_file(photo.file_id)
+    file_url = f"https://api.telegram.org/file/bot{bot.token}/{file.file_path}"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(file_url) as resp:
+                image_bytes = await resp.read()
+
+        analysis = await analyze_image(image_bytes, mime="image/jpeg")
+        if not analysis:
+            await processing_msg.edit_text("⚠️ Не удалось распознать изображение.")
+            return
+
+        _pending[message.from_user.id] = {"text": analysis, "note_type": NoteType.IMAGE}
+        await processing_msg.edit_text(
+            f"🖼 Вот что на изображении:\n\n{analysis[:1500]}\n\n"
+            "Что сделать с этими данными?",
+            reply_markup=kb_main_choice(),
+        )
+    except Exception:
+        logger.exception("Image analysis error")
+        await processing_msg.edit_text("⚠️ Ошибка при анализе изображения.")
+
+
+# ═══════════════════════════════════════════════════════════════
 #  INPUT: Text → choice (unless in FSM edit mode)
 # ═══════════════════════════════════════════════════════════════
 
@@ -298,6 +464,11 @@ async def handle_text(message: Message, state: FSMContext) -> None:
     # If editing a note — handle FSM
     if current == EditNote.waiting_for_text.state:
         await _finish_edit(message, state, text)
+        return
+
+    # If entering timezone offset manually
+    if current == TzStates.waiting_offset.state:
+        await _finish_tz_offset(message, state, text)
         return
 
     # If adding user via admin
@@ -333,14 +504,19 @@ async def cb_save(callback: CallbackQuery) -> None:
     await callback.message.edit_reply_markup(reply_markup=None)
 
     try:
-        note = await process_and_save_note(
+        note, reminders = await process_and_save_note(
             user_id=user_id, text=data["text"], note_type=data["note_type"],
         )
         tags_str = ", ".join(f"#{t}" for t in note.tags) if note.tags else "—"
+        rem_line = (
+            f"\n⏰ Поставил напоминаний: {reminders} (напомню за сутки)"
+            if reminders else ""
+        )
         await callback.message.answer(
             f"✅ Запомнил!\n\n"
             f"📋 {note.summary}\n"
-            f"🏷 {tags_str}",
+            f"🏷 {tags_str}"
+            f"{rem_line}",
             reply_markup=kb_after_save(),
         )
     except Exception:
@@ -467,9 +643,10 @@ async def cb_notes_all(callback: CallbackQuery) -> None:
         await callback.message.edit_text("Заметок пока нет.", reply_markup=kb_home())
         return
 
+    tz = await timezones.get_tz(user_id)
     await callback.message.edit_text(
         "📋 Ваши заметки:",
-        reply_markup=_notes_list_kb(notes, offset, "notes_all"),
+        reply_markup=_notes_list_kb(notes, offset, tz, "notes_all"),
     )
 
 
@@ -520,9 +697,10 @@ async def cb_fdate(callback: CallbackQuery) -> None:
         await callback.message.edit_text("За этот период заметок нет.", reply_markup=kb_after_action())
         return
 
+    tz = await timezones.get_tz(user_id)
     await callback.message.edit_text(
         f"📅 Заметки за период:",
-        reply_markup=_notes_list_kb(notes, 0, "notes_all"),
+        reply_markup=_notes_list_kb(notes, 0, tz, "notes_all"),
     )
 
 
@@ -561,9 +739,10 @@ async def cb_ftag(callback: CallbackQuery) -> None:
         await callback.message.edit_text(f"Заметок с тегом #{tag} нет.", reply_markup=kb_after_action())
         return
 
+    tz = await timezones.get_tz(user_id)
     await callback.message.edit_text(
         f"🏷 Заметки с тегом #{tag}:",
-        reply_markup=_notes_list_kb(notes, 0, "notes_all"),
+        reply_markup=_notes_list_kb(notes, 0, tz, "notes_all"),
     )
 
 
@@ -594,9 +773,10 @@ async def cb_ftype(callback: CallbackQuery) -> None:
         await callback.message.edit_text(f"Нет {type_label} заметок.", reply_markup=kb_after_action())
         return
 
+    tz = await timezones.get_tz(user_id)
     await callback.message.edit_text(
         "📋 Найденные заметки:",
-        reply_markup=_notes_list_kb(notes, 0, "notes_all"),
+        reply_markup=_notes_list_kb(notes, 0, tz, "notes_all"),
     )
 
 
@@ -623,8 +803,10 @@ async def cb_note_actions(callback: CallbackQuery) -> None:
         await callback.message.edit_text("Заметка не найдена.", reply_markup=kb_after_action())
         return
 
-    date_str = fmt_date(note.created_at)
-    type_icon = "🎤 голос" if note.note_type == NoteType.VOICE else "📝 текст"
+    tz = await timezones.get_tz(callback.from_user.id)
+    date_str = fmt_date(note.created_at, tz)
+    type_labels = {NoteType.VOICE: "🎤 голос", NoteType.IMAGE: "🖼 фото"}
+    type_icon = type_labels.get(note.note_type, "📝 текст")
     tags_str = ", ".join(f"#{t}" for t in note.tags) if note.tags else "—"
 
     await callback.message.edit_text(
@@ -647,7 +829,8 @@ async def cb_note_view(callback: CallbackQuery) -> None:
         await callback.message.edit_text("Заметка не найдена.", reply_markup=kb_after_action())
         return
 
-    date_str = fmt_date(note.created_at)
+    tz = await timezones.get_tz(callback.from_user.id)
+    date_str = fmt_date(note.created_at, tz)
     tags_str = ", ".join(f"#{t}" for t in note.tags) if note.tags else "—"
     text = note.full_text[:3500]  # Telegram message limit
 
@@ -708,12 +891,17 @@ async def _finish_edit(message: Message, state: FSMContext, new_text: str) -> No
         return
 
     try:
-        updated = await update_existing_note(note, new_text)
+        updated, reminders = await update_existing_note(note, new_text)
         tags_str = ", ".join(f"#{t}" for t in updated.tags) if updated.tags else "—"
+        rem_line = (
+            f"\n⏰ Напоминаний: {reminders} (напомню за сутки)"
+            if reminders else ""
+        )
         await message.answer(
             f"✅ Заметка обновлена!\n\n"
             f"📋 {updated.summary}\n"
-            f"🏷 {tags_str}",
+            f"🏷 {tags_str}"
+            f"{rem_line}",
             reply_markup=kb_after_action(),
         )
     except Exception:
@@ -756,7 +944,8 @@ async def cb_note_del_no(callback: CallbackQuery) -> None:
     # Return to note actions
     note = await postgres.get_note_by_id(note_id)
     if note:
-        date_str = fmt_date(note.created_at)
+        tz = await timezones.get_tz(callback.from_user.id)
+        date_str = fmt_date(note.created_at, tz)
         tags_str = ", ".join(f"#{t}" for t in note.tags) if note.tags else "—"
         await callback.message.edit_text(
             f"📋 Заметка от {date_str}\n\n📝 {note.summary}\n🏷 {tags_str}",
@@ -764,6 +953,202 @@ async def cb_note_del_no(callback: CallbackQuery) -> None:
         )
     else:
         await callback.message.edit_text("Заметка не найдена.", reply_markup=kb_after_action())
+
+
+# ═══════════════════════════════════════════════════════════════
+#  REMINDERS
+# ═══════════════════════════════════════════════════════════════
+
+async def _reminders_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    reminders = await postgres.get_upcoming_reminders(user_id)
+    tz = await timezones.get_tz(user_id)
+    if not reminders:
+        return (
+            "⏰ Ближайших напоминаний нет.\n\n"
+            "Запиши мысль с датой и временем — например «в среду в 19:00 театр», "
+            "и я напомню за сутки.",
+            kb_main_menu(),
+        )
+    lines = []
+    buttons = []
+    for r in reminders:
+        when = fmt_date(r.event_at, tz, "%d.%m.%Y %H:%M")
+        lines.append(f"📌 {when} — {r.title}")
+        buttons.append([InlineKeyboardButton(
+            text=f"🗑 {r.title[:35]}", callback_data=f"rem_del:{r.id}"
+        )])
+    buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")])
+    text = (
+        "⏰ Ближайшие напоминания:\n\n"
+        + "\n".join(lines)
+        + "\n\nНажми «🗑», чтобы убрать ненужное."
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.message(Command("reminders"))
+async def cmd_reminders(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    text, kb = await _reminders_view(message.from_user.id)
+    await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "reminders")
+async def cb_reminders(callback: CallbackQuery) -> None:
+    await callback.answer()
+    text, kb = await _reminders_view(callback.from_user.id)
+    await callback.message.edit_text(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("rem_del:"))
+async def cb_rem_del(callback: CallbackQuery) -> None:
+    await callback.answer("Напоминание убрано")
+    rid = callback.data.split(":", 1)[1]
+    await postgres.delete_reminder(rid)
+    text, kb = await _reminders_view(callback.from_user.id)
+    await callback.message.edit_text(text, reply_markup=kb)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  WEEKLY SUMMARY
+# ═══════════════════════════════════════════════════════════════
+
+async def _send_summary(user_id: int, send) -> None:
+    wait = await send("🗓 Готовлю сводку за неделю...")
+    try:
+        text = await build_weekly_summary(user_id)
+        await wait.edit_text(text, reply_markup=kb_main_menu())
+    except Exception:
+        logger.exception("Summary error")
+        await wait.edit_text("⚠️ Не удалось сформировать сводку.", reply_markup=kb_home())
+
+
+@router.message(Command("summary"))
+async def cmd_summary(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await _send_summary(message.from_user.id, message.answer)
+
+
+@router.callback_query(F.data == "do_summary")
+async def cb_summary(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await _send_summary(callback.from_user.id, callback.message.answer)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  SETTINGS (timezone + weekly summary schedule)
+# ═══════════════════════════════════════════════════════════════
+
+async def _settings_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    s = await postgres.get_user_settings(user_id) or UserSettings(user_id=user_id)
+    status = "включена ✅" if s.summary_enabled else "выключена ❌"
+    day = WEEKDAY_NAMES[s.summary_weekday]
+    text = (
+        "⚙️ Настройки\n\n"
+        f"🌍 Часовой пояс: {s.timezone}\n"
+        f"🗓 Авто-сводка: {status}\n"
+        f"📅 День: {day}\n"
+        f"🕐 Время: {s.summary_hour:02d}:00"
+    )
+    toggle_label = "🔕 Выключить сводку" if s.summary_enabled else "🔔 Включить сводку"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌍 Сменить часовой пояс", callback_data="set_tz")],
+        [InlineKeyboardButton(text=toggle_label, callback_data="sum_toggle")],
+        [
+            InlineKeyboardButton(text="📅 День сводки", callback_data="sum_day"),
+            InlineKeyboardButton(text="🕐 Время сводки", callback_data="sum_hour"),
+        ],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")],
+    ])
+    return text, kb
+
+
+@router.message(Command("settings"))
+async def cmd_settings(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    text, kb = await _settings_view(message.from_user.id)
+    await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "settings")
+async def cb_settings(callback: CallbackQuery) -> None:
+    await callback.answer()
+    text, kb = await _settings_view(callback.from_user.id)
+    await callback.message.edit_text(text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "set_tz")
+async def cb_set_tz_menu(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await callback.message.edit_text("🌍 Выбери часовой пояс:", reply_markup=kb_timezone())
+
+
+async def _current_settings(user_id: int) -> UserSettings:
+    return await postgres.get_user_settings(user_id) or UserSettings(user_id=user_id)
+
+
+@router.callback_query(F.data == "sum_toggle")
+async def cb_sum_toggle(callback: CallbackQuery) -> None:
+    await callback.answer()
+    s = await _current_settings(callback.from_user.id)
+    await postgres.set_summary_schedule(
+        s.user_id, s.summary_weekday, s.summary_hour, not s.summary_enabled
+    )
+    text, kb = await _settings_view(callback.from_user.id)
+    await callback.message.edit_text(text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "sum_day")
+async def cb_sum_day(callback: CallbackQuery) -> None:
+    await callback.answer()
+    buttons = [
+        [InlineKeyboardButton(text=name, callback_data=f"sum_setday:{i}")]
+        for i, name in enumerate(WEEKDAY_NAMES)
+    ]
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="settings")])
+    await callback.message.edit_text(
+        "📅 В какой день присылать сводку?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@router.callback_query(F.data.startswith("sum_setday:"))
+async def cb_sum_setday(callback: CallbackQuery) -> None:
+    await callback.answer()
+    weekday = int(callback.data.split(":")[1])
+    s = await _current_settings(callback.from_user.id)
+    await postgres.set_summary_schedule(s.user_id, weekday, s.summary_hour, s.summary_enabled)
+    text, kb = await _settings_view(callback.from_user.id)
+    await callback.message.edit_text(text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "sum_hour")
+async def cb_sum_hour(callback: CallbackQuery) -> None:
+    await callback.answer()
+    buttons = []
+    row = []
+    for h in range(24):
+        row.append(InlineKeyboardButton(text=f"{h:02d}", callback_data=f"sum_sethour:{h}"))
+        if len(row) == 6:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="settings")])
+    await callback.message.edit_text(
+        "🕐 В котором часу присылать сводку (по твоему времени)?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@router.callback_query(F.data.startswith("sum_sethour:"))
+async def cb_sum_sethour(callback: CallbackQuery) -> None:
+    await callback.answer()
+    hour = int(callback.data.split(":")[1])
+    s = await _current_settings(callback.from_user.id)
+    await postgres.set_summary_schedule(s.user_id, s.summary_weekday, hour, s.summary_enabled)
+    text, kb = await _settings_view(callback.from_user.id)
+    await callback.message.edit_text(text, reply_markup=kb)
 
 
 # ═══════════════════════════════════════════════════════════════
