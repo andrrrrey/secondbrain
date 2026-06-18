@@ -413,3 +413,38 @@ async def analyze_image(image_bytes: bytes, mime: str = "image/jpeg") -> str:
     if not result or not result.strip():
         return "Не удалось распознать изображение."
     return result
+
+
+async def classify_image_intent(caption: str) -> str:
+    """Определить, что пользователь хочет сделать с изображением по его подписи.
+
+    Возвращает одно из: 'note', 'reminder', 'ask', 'search', 'unclear'.
+    """
+    client = get_text_client()
+    resp = await client.chat.completions.create(
+        model=_text_model(),
+        temperature=0,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Пользователь прислал изображение с подписью-командой. "
+                    "Определи, что он хочет сделать. Ответь ТОЛЬКО одним словом:\n"
+                    "- note — сохранить как заметку (запомнить, сохрани, заметка)\n"
+                    "- reminder — поставить напоминание (есть дата/время/«напомни»)\n"
+                    "- ask — задать вопрос ИИ об изображении (что это, объясни, "
+                    "переведи, посчитай, вопрос по содержимому)\n"
+                    "- search — найти в сохранённых заметках (найди, поищи в памяти)\n"
+                    "- unclear — намерение неясно\n"
+                    "Отвечай строго одним словом из списка."
+                ),
+            },
+            {"role": "user", "content": caption},
+        ],
+        max_completion_tokens=10,
+    )
+    result = (resp.choices[0].message.content or "").strip().lower()
+    for intent in ("reminder", "note", "ask", "search"):
+        if intent in result:
+            return intent
+    return "unclear"

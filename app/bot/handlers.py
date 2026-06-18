@@ -22,7 +22,7 @@ from aiogram.types import (
 
 from app.db import postgres
 from app.models import NoteType, UserSettings
-from app.services.llm import analyze_image, reset_openai_client
+from app.services.llm import analyze_image, classify_image_intent, reset_openai_client
 from app.services.notes import delete_note_full, process_and_save_note, update_existing_note
 from app.services.search import ask_ai, search_and_answer
 from app.services.stt import transcribe
@@ -431,6 +431,9 @@ async def handle_photo(message: Message, bot: Bot, state: FSMContext) -> None:
     file = await bot.get_file(photo.file_id)
     file_url = f"https://api.telegram.org/file/bot{bot.token}/{file.file_path}"
 
+    caption = (message.caption or "").strip()
+    user_id = message.from_user.id
+
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(file_url) as resp:
@@ -441,12 +444,38 @@ async def handle_photo(message: Message, bot: Bot, state: FSMContext) -> None:
             await processing_msg.edit_text("⚠️ Не удалось распознать изображение.")
             return
 
-        _pending[message.from_user.id] = {"text": analysis, "note_type": NoteType.IMAGE}
-        await processing_msg.edit_text(
-            f"🖼 Вот что на изображении:\n\n{analysis[:1500]}\n\n"
-            "Что сделать с этими данными?",
-            reply_markup=kb_main_choice(),
+        # Если есть подпись — учитываем её как команду; иначе данные = распознанное
+        combined = f"{caption}\n\n📄 Распознано на изображении:\n{analysis}" if caption else analysis
+        header = f"🖼 Вот что на изображении:\n\n{analysis[:1500]}"
+
+        if caption:
+            intent = await classify_image_intent(caption)
+            logger.info("Image caption intent: %s (caption=%r)", intent, caption)
+
+            if intent in ("note", "reminder"):
+                _pending.pop(user_id, None)
+                await processing_msg.edit_text(header)
+                await _perform_save(user_id, combined, NoteType.IMAGE, processing_msg)
+                return
+            if intent == "ask":
+                _pending.pop(user_id, None)
+                await processing_msg.edit_text(header)
+                await _perform_ask(user_id, combined, processing_msg)
+                return
+            if intent == "search":
+                _pending.pop(user_id, None)
+                await processing_msg.edit_text(header)
+                await _perform_search(user_id, combined, processing_msg)
+                return
+            # intent == "unclear" → уточняем у пользователя
+
+        # Нет подписи или намерение неясно — спрашиваем кнопками
+        _pending[user_id] = {"text": combined, "note_type": NoteType.IMAGE}
+        clarify = (
+            "\n\nНе понял, что сделать с подписью. Выбери действие:"
+            if caption else "\n\nЧто сделать с этими данными?"
         )
+        await processing_msg.edit_text(header + clarify, reply_markup=kb_main_choice())
     except Exception:
         logger.exception("Image analysis error")
         await processing_msg.edit_text("⚠️ Ошибка при анализе изображения.")
@@ -505,17 +534,20 @@ async def cb_save(callback: CallbackQuery) -> None:
 
     await callback.answer()
     await callback.message.edit_reply_markup(reply_markup=None)
+    await _perform_save(user_id, data["text"], data["note_type"], callback.message)
 
+
+async def _perform_save(user_id: int, text: str, note_type: NoteType, message: Message) -> None:
     try:
         note, reminders = await process_and_save_note(
-            user_id=user_id, text=data["text"], note_type=data["note_type"],
+            user_id=user_id, text=text, note_type=note_type,
         )
         tags_str = ", ".join(f"#{t}" for t in note.tags) if note.tags else "—"
         rem_line = (
             f"\n⏰ Поставил напоминаний: {reminders} (напомню за сутки)"
             if reminders else ""
         )
-        await callback.message.answer(
+        await message.answer(
             f"✅ Запомнил!\n\n"
             f"📋 {note.summary}\n"
             f"🏷 {tags_str}"
@@ -524,7 +556,7 @@ async def cb_save(callback: CallbackQuery) -> None:
         )
     except Exception:
         logger.exception("Error saving note")
-        await callback.message.answer("⚠️ Ошибка при сохранении.", reply_markup=kb_home())
+        await message.answer("⚠️ Ошибка при сохранении.", reply_markup=kb_home())
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -541,15 +573,18 @@ async def cb_search(callback: CallbackQuery) -> None:
 
     await callback.answer()
     await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer("🔍 Ищу в памяти...")
+    await _perform_search(user_id, data["text"], callback.message)
 
+
+async def _perform_search(user_id: int, text: str, message: Message) -> None:
+    await message.answer("🔍 Ищу в памяти...")
     try:
-        answer = await search_and_answer(user_id, data["text"])
+        answer = await search_and_answer(user_id, text)
         _last_bot_message[user_id] = answer
-        await callback.message.answer(answer, reply_markup=kb_after_search())
+        await message.answer(answer, reply_markup=kb_after_search())
     except Exception:
         logger.exception("Search error")
-        await callback.message.answer("⚠️ Ошибка при поиске.", reply_markup=kb_home())
+        await message.answer("⚠️ Ошибка при поиске.", reply_markup=kb_home())
 
 
 @router.callback_query(F.data == "do_search_fresh")
@@ -573,18 +608,19 @@ async def cb_ask_ai(callback: CallbackQuery) -> None:
 
     await callback.answer()
     await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer("🤖 Думаю...")
+    await _perform_ask(user_id, data["text"], callback.message)
 
-    query_text = data["text"]
+
+async def _perform_ask(user_id: int, text: str, message: Message) -> None:
+    await message.answer("🤖 Думаю...")
     last_msg = _last_bot_message.get(user_id)
-
     try:
-        answer = await ask_ai(user_id, query_text, last_bot_message=last_msg)
+        answer = await ask_ai(user_id, text, last_bot_message=last_msg)
         _last_bot_message[user_id] = answer
-        await callback.message.answer(answer, reply_markup=kb_after_search())
+        await message.answer(answer, reply_markup=kb_after_search())
     except Exception:
         logger.exception("Ask AI error")
-        await callback.message.answer("⚠️ Ошибка при обращении к ИИ.", reply_markup=kb_home())
+        await message.answer("⚠️ Ошибка при обращении к ИИ.", reply_markup=kb_home())
 
 
 @router.callback_query(F.data == "save_answer")
