@@ -1130,15 +1130,26 @@ async def _settings_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         f"🕐 Время: {s.summary_hour:02d}:00"
     )
     toggle_label = "🔕 Выключить сводку" if s.summary_enabled else "🔔 Включить сводку"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [InlineKeyboardButton(text="🌍 Сменить часовой пояс", callback_data="set_tz")],
         [InlineKeyboardButton(text=toggle_label, callback_data="sum_toggle")],
         [
             InlineKeyboardButton(text="📅 День сводки", callback_data="sum_day"),
             InlineKeyboardButton(text="🕐 Время сводки", callback_data="sum_hour"),
         ],
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")],
-    ])
+    ]
+    if _is_admin(user_id):
+        text += (
+            "\n\n🔐 Админ:\n"
+            f"🔑 OpenAI: {_mask_key(rt.api_key)}\n"
+            f"🔑 RouterAI: {_mask_key(rt.routerai_key)}"
+        )
+        rows.append([
+            InlineKeyboardButton(text="🔑 Ключ OpenAI", callback_data="admin_key_openai"),
+            InlineKeyboardButton(text="🔑 Ключ RouterAI", callback_data="admin_key_routerai"),
+        ])
+    rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
     return text, kb
 
 
