@@ -69,6 +69,7 @@ class AdminStates(StatesGroup):
     waiting_add_user = State()
     waiting_remove_user = State()
     waiting_api_key = State()
+    waiting_routerai_key = State()
 
 
 # ── Pending voice/text storage ──────────────────────────────────
@@ -85,7 +86,8 @@ COMMANDS = [
     BotCommand(command="summary", description="Сводка за неделю"),
     BotCommand(command="settings", description="Настройки (пояс, сводка)"),
     BotCommand(command="admin", description="Управление ботом (админ)"),
-    BotCommand(command="api", description="Сменить API-ключ (админ)"),
+    BotCommand(command="api", description="Сменить ключ OpenAI (админ)"),
+    BotCommand(command="routerai", description="Сменить ключ RouterAI (админ)"),
 ]
 
 
@@ -508,9 +510,14 @@ async def handle_text(message: Message, state: FSMContext) -> None:
         await _finish_add_user(message, state, text)
         return
 
-    # If changing API key
+    # If changing OpenAI API key
     if current == AdminStates.waiting_api_key.state:
         await _finish_api_key(message, state, text)
+        return
+
+    # If changing RouterAI API key
+    if current == AdminStates.waiting_routerai_key.state:
+        await _finish_routerai_key(message, state, text)
         return
 
     _pending[message.from_user.id] = {"text": text, "note_type": NoteType.TEXT}
@@ -1123,15 +1130,26 @@ async def _settings_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         f"🕐 Время: {s.summary_hour:02d}:00"
     )
     toggle_label = "🔕 Выключить сводку" if s.summary_enabled else "🔔 Включить сводку"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [InlineKeyboardButton(text="🌍 Сменить часовой пояс", callback_data="set_tz")],
         [InlineKeyboardButton(text=toggle_label, callback_data="sum_toggle")],
         [
             InlineKeyboardButton(text="📅 День сводки", callback_data="sum_day"),
             InlineKeyboardButton(text="🕐 Время сводки", callback_data="sum_hour"),
         ],
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")],
-    ])
+    ]
+    if _is_admin(user_id):
+        text += (
+            "\n\n🔐 Админ:\n"
+            f"🔑 OpenAI: {_mask_key(rt.api_key)}\n"
+            f"🔑 RouterAI: {_mask_key(rt.routerai_key)}"
+        )
+        rows.append([
+            InlineKeyboardButton(text="🔑 Ключ OpenAI", callback_data="admin_key_openai"),
+            InlineKeyboardButton(text="🔑 Ключ RouterAI", callback_data="admin_key_routerai"),
+        ])
+    rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
     return text, kb
 
 
@@ -1231,6 +1249,15 @@ def _is_admin(user_id: int) -> bool:
     return user_id == settings.admin_user_id
 
 
+def _mask_key(key: str) -> str:
+    """Безопасно замаскировать API-ключ для показа."""
+    if not key:
+        return "не задан"
+    if len(key) <= 12:
+        return key[:2] + "…"
+    return key[:8] + "…" + key[-4:]
+
+
 def _admin_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -1239,6 +1266,10 @@ def _admin_kb() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="📋 Список пользователей", callback_data="admin_list"),
+        ],
+        [
+            InlineKeyboardButton(text="🔑 Ключ OpenAI", callback_data="admin_key_openai"),
+            InlineKeyboardButton(text="🔑 Ключ RouterAI", callback_data="admin_key_routerai"),
         ],
         [
             InlineKeyboardButton(text="🏠 Главное меню", callback_data="home"),
@@ -1404,9 +1435,82 @@ async def _finish_api_key(message: Message, state: FSMContext, text: str) -> Non
     reset_openai_client()
     await state.clear()
 
-    masked = new_key[:8] + "..." + new_key[-4:]
     await message.answer(
-        f"✅ API-ключ обновлён: {masked}\n\n"
+        f"✅ Ключ OpenAI обновлён: {_mask_key(new_key)}\n\n"
+        "⚠️ Ключ изменён только в памяти. После перезапуска бота вернётся ключ из .env.",
+        reply_markup=_admin_kb(),
+    )
+
+
+@router.callback_query(F.data == "admin_key_openai")
+async def cb_admin_key_openai(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа.")
+        return
+
+    await callback.answer()
+    await state.set_state(AdminStates.waiting_api_key)
+    await callback.message.edit_text(
+        f"🔑 Текущий ключ OpenAI: {_mask_key(rt.api_key)}\n\n"
+        "Отправь новый API-ключ OpenAI (используется для поиска, голоса и фото):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel")],
+        ]),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ADMIN: /routerai — change RouterAI (Claude) API key
+# ═══════════════════════════════════════════════════════════════
+
+@router.message(Command("routerai"))
+async def cmd_routerai(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message.from_user.id):
+        await message.answer("⛔ Только администратор может использовать эту команду.")
+        return
+
+    await state.set_state(AdminStates.waiting_routerai_key)
+    await message.answer(
+        f"🔑 Текущий ключ RouterAI: {_mask_key(rt.routerai_key)}\n\n"
+        "Отправь новый API-ключ RouterAI (используется для обработки текста через Claude):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel")],
+        ]),
+    )
+
+
+@router.callback_query(F.data == "admin_key_routerai")
+async def cb_admin_key_routerai(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа.")
+        return
+
+    await callback.answer()
+    await state.set_state(AdminStates.waiting_routerai_key)
+    await callback.message.edit_text(
+        f"🔑 Текущий ключ RouterAI: {_mask_key(rt.routerai_key)}\n\n"
+        "Отправь новый API-ключ RouterAI (используется для обработки текста через Claude):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel")],
+        ]),
+    )
+
+
+async def _finish_routerai_key(message: Message, state: FSMContext, text: str) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+
+    new_key = text.strip()
+    if len(new_key) < 10:
+        await message.answer("⚠️ Ключ выглядит слишком коротким. Попробуй ещё раз.")
+        return
+
+    rt.routerai_key = new_key
+    reset_openai_client()
+    await state.clear()
+
+    await message.answer(
+        f"✅ Ключ RouterAI обновлён: {_mask_key(new_key)}\n\n"
         "⚠️ Ключ изменён только в памяти. После перезапуска бота вернётся ключ из .env.",
         reply_markup=_admin_kb(),
     )
