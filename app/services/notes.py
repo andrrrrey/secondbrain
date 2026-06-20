@@ -20,6 +20,8 @@ async def _create_reminders_for_note(user_id: int, note_id: str, text: str) -> i
         tz = await get_tz(user_id)
         now_local = datetime.now(tz)
         now_utc = datetime.now(timezone.utc)
+        user_settings = await postgres.get_user_settings(user_id)
+        lead_minutes = user_settings.reminder_lead_minutes if user_settings else 1440
         events = await extract_reminders(text, now_local.isoformat(), str(tz))
 
         created = 0
@@ -34,7 +36,7 @@ async def _create_reminders_for_note(user_id: int, note_id: str, text: str) -> i
             event_utc = event_local.astimezone(timezone.utc)
             if event_utc <= now_utc:
                 continue  # событие в прошлом — пропускаем
-            remind_at = max(now_utc, event_utc - timedelta(hours=24))
+            remind_at = max(now_utc, event_utc - timedelta(minutes=lead_minutes))
             await postgres.add_reminder(Reminder(
                 user_id=user_id,
                 note_id=note_id,

@@ -52,8 +52,12 @@ async def init_tables() -> None:
                 summary_enabled BOOLEAN NOT NULL DEFAULT true,
                 summary_weekday INT NOT NULL DEFAULT 6,
                 summary_hour    INT NOT NULL DEFAULT 18,
-                last_summary_at TIMESTAMPTZ
+                last_summary_at TIMESTAMPTZ,
+                reminder_lead_minutes INT NOT NULL DEFAULT 1440
             );
+
+            ALTER TABLE user_settings
+                ADD COLUMN IF NOT EXISTS reminder_lead_minutes INT NOT NULL DEFAULT 1440;
 
             CREATE TABLE IF NOT EXISTS reminders (
                 id          TEXT PRIMARY KEY,
@@ -203,6 +207,10 @@ async def get_user_settings(user_id: int) -> UserSettings | None:
         )
     if row is None:
         return None
+    return _row_to_settings(row)
+
+
+def _row_to_settings(row: asyncpg.Record) -> UserSettings:
     return UserSettings(
         user_id=row["user_id"],
         timezone=row["timezone"],
@@ -210,6 +218,7 @@ async def get_user_settings(user_id: int) -> UserSettings | None:
         summary_weekday=row["summary_weekday"],
         summary_hour=row["summary_hour"],
         last_summary_at=row["last_summary_at"],
+        reminder_lead_minutes=row["reminder_lead_minutes"],
     )
 
 
@@ -219,17 +228,20 @@ async def upsert_user_settings(s: UserSettings) -> None:
         await conn.execute(
             """
             INSERT INTO user_settings
-                (user_id, timezone, summary_enabled, summary_weekday, summary_hour, last_summary_at)
-            VALUES ($1, $2, $3, $4, $5, $6)
+                (user_id, timezone, summary_enabled, summary_weekday, summary_hour,
+                 last_summary_at, reminder_lead_minutes)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT (user_id) DO UPDATE SET
                 timezone = EXCLUDED.timezone,
                 summary_enabled = EXCLUDED.summary_enabled,
                 summary_weekday = EXCLUDED.summary_weekday,
                 summary_hour = EXCLUDED.summary_hour,
-                last_summary_at = EXCLUDED.last_summary_at
+                last_summary_at = EXCLUDED.last_summary_at,
+                reminder_lead_minutes = EXCLUDED.reminder_lead_minutes
             """,
             s.user_id, s.timezone, s.summary_enabled,
             s.summary_weekday, s.summary_hour, s.last_summary_at,
+            s.reminder_lead_minutes,
         )
 
 
@@ -264,6 +276,20 @@ async def set_summary_schedule(
         )
 
 
+async def set_reminder_lead(user_id: int, minutes: int) -> None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO user_settings (user_id, reminder_lead_minutes)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET
+                reminder_lead_minutes = EXCLUDED.reminder_lead_minutes
+            """,
+            user_id, minutes,
+        )
+
+
 async def update_last_summary(user_id: int, dt: datetime) -> None:
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -279,17 +305,7 @@ async def get_all_summary_users() -> list[UserSettings]:
         rows = await conn.fetch(
             "SELECT * FROM user_settings WHERE summary_enabled = true"
         )
-    return [
-        UserSettings(
-            user_id=r["user_id"],
-            timezone=r["timezone"],
-            summary_enabled=r["summary_enabled"],
-            summary_weekday=r["summary_weekday"],
-            summary_hour=r["summary_hour"],
-            last_summary_at=r["last_summary_at"],
-        )
-        for r in rows
-    ]
+    return [_row_to_settings(r) for r in rows]
 
 
 # ── Reminders ────────────────────────────────────────────────────

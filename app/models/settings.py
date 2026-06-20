@@ -25,6 +25,7 @@ class UserSettings(BaseModel):
     summary_weekday: int = 6  # воскресенье
     summary_hour: int = 18
     last_summary_at: datetime | None = None
+    reminder_lead_minutes: int = 1440  # за сколько до события напоминать (24 ч)
 
 
 class Reminder(BaseModel):
