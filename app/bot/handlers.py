@@ -41,6 +41,25 @@ WEEKDAY_NAMES = [
     "Пятница", "Суббота", "Воскресенье",
 ]
 
+# За сколько до события напоминать (минуты, подпись)
+REMINDER_LEAD_OPTIONS = [
+    (1440, "за 24 часа"),
+    (720, "за 12 часов"),
+    (360, "за 6 часов"),
+    (180, "за 3 часа"),
+    (60, "за 1 час"),
+    (30, "за 30 минут"),
+]
+
+
+def _lead_label(minutes: int) -> str:
+    for m, label in REMINDER_LEAD_OPTIONS:
+        if m == minutes:
+            return label
+    if minutes % 60 == 0:
+        return f"за {minutes // 60} ч"
+    return f"за {minutes} мин"
+
 TYPE_ICONS = {
     NoteType.VOICE: "🎤",
     NoteType.IMAGE: "🖼",
@@ -298,7 +317,8 @@ async def cmd_help(message: Message) -> None:
         "🤖 *Спросить у ИИ*\n"
         "Отправь вопрос → «🤖 Спросить у ИИ» (ответит с учётом заметок).\n\n"
         "⏰ *Напоминания*\n"
-        "Просто запиши мысль с датой — я напомню за сутки.\n"
+        "Просто запиши мысль с датой — я напомню заранее.\n"
+        "За сколько напоминать — настраивается в /settings.\n"
         "Пример: «хочу в театр в среду в 19:00».\n"
         "Список и удаление — команда /reminders\n\n"
         "🗓 *Сводка за неделю*\n"
@@ -550,10 +570,11 @@ async def _perform_save(user_id: int, text: str, note_type: NoteType, message: M
             user_id=user_id, text=text, note_type=note_type,
         )
         tags_str = ", ".join(f"#{t}" for t in note.tags) if note.tags else "—"
-        rem_line = (
-            f"\n⏰ Поставил напоминаний: {reminders} (напомню за сутки)"
-            if reminders else ""
-        )
+        rem_line = ""
+        if reminders:
+            s = await postgres.get_user_settings(user_id)
+            lead = _lead_label(s.reminder_lead_minutes if s else 1440)
+            rem_line = f"\n⏰ Поставил напоминаний: {reminders} (напомню {lead})"
         await message.answer(
             f"✅ Запомнил!\n\n"
             f"📋 {note.summary}\n"
@@ -647,10 +668,11 @@ async def cb_save_answer(callback: CallbackQuery) -> None:
             user_id=user_id, text=answer, note_type=NoteType.TEXT,
         )
         tags_str = ", ".join(f"#{t}" for t in note.tags) if note.tags else "—"
-        rem_line = (
-            f"\n⏰ Поставил напоминаний: {reminders} (напомню за сутки)"
-            if reminders else ""
-        )
+        rem_line = ""
+        if reminders:
+            s = await postgres.get_user_settings(user_id)
+            lead = _lead_label(s.reminder_lead_minutes if s else 1440)
+            rem_line = f"\n⏰ Поставил напоминаний: {reminders} (напомню {lead})"
         await callback.message.answer(
             f"✅ Ответ сохранён в заметки!\n\n"
             f"📋 {note.summary}\n"
@@ -972,10 +994,11 @@ async def _finish_edit(message: Message, state: FSMContext, new_text: str) -> No
     try:
         updated, reminders = await update_existing_note(note, new_text)
         tags_str = ", ".join(f"#{t}" for t in updated.tags) if updated.tags else "—"
-        rem_line = (
-            f"\n⏰ Напоминаний: {reminders} (напомню за сутки)"
-            if reminders else ""
-        )
+        rem_line = ""
+        if reminders:
+            s = await postgres.get_user_settings(updated.user_id)
+            lead = _lead_label(s.reminder_lead_minutes if s else 1440)
+            rem_line = f"\n⏰ Напоминаний: {reminders} (напомню {lead})"
         await message.answer(
             f"✅ Заметка обновлена!\n\n"
             f"📋 {updated.summary}\n"
@@ -1045,7 +1068,7 @@ async def _reminders_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         return (
             "⏰ Ближайших напоминаний нет.\n\n"
             "Запиши мысль с датой и временем — например «в среду в 19:00 театр», "
-            "и я напомню за сутки.",
+            "и я напомню заранее (настройка времени — в /settings).",
             kb_main_menu(),
         )
     lines = []
@@ -1125,6 +1148,7 @@ async def _settings_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     text = (
         "⚙️ Настройки\n\n"
         f"🌍 Часовой пояс: {s.timezone}\n"
+        f"⏰ Напоминать: {_lead_label(s.reminder_lead_minutes)} до события\n"
         f"🗓 Авто-сводка: {status}\n"
         f"📅 День: {day}\n"
         f"🕐 Время: {s.summary_hour:02d}:00"
@@ -1132,6 +1156,7 @@ async def _settings_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     toggle_label = "🔕 Выключить сводку" if s.summary_enabled else "🔔 Включить сводку"
     rows = [
         [InlineKeyboardButton(text="🌍 Сменить часовой пояс", callback_data="set_tz")],
+        [InlineKeyboardButton(text="⏰ За сколько напоминать", callback_data="rem_lead")],
         [InlineKeyboardButton(text=toggle_label, callback_data="sum_toggle")],
         [
             InlineKeyboardButton(text="📅 День сводки", callback_data="sum_day"),
@@ -1184,6 +1209,29 @@ async def cb_sum_toggle(callback: CallbackQuery) -> None:
     await postgres.set_summary_schedule(
         s.user_id, s.summary_weekday, s.summary_hour, not s.summary_enabled
     )
+    text, kb = await _settings_view(callback.from_user.id)
+    await callback.message.edit_text(text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "rem_lead")
+async def cb_rem_lead(callback: CallbackQuery) -> None:
+    await callback.answer()
+    buttons = [
+        [InlineKeyboardButton(text=label, callback_data=f"rem_setlead:{minutes}")]
+        for minutes, label in REMINDER_LEAD_OPTIONS
+    ]
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="settings")])
+    await callback.message.edit_text(
+        "⏰ За сколько до события присылать напоминание?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@router.callback_query(F.data.startswith("rem_setlead:"))
+async def cb_rem_setlead(callback: CallbackQuery) -> None:
+    await callback.answer()
+    minutes = int(callback.data.split(":")[1])
+    await postgres.set_reminder_lead(callback.from_user.id, minutes)
     text, kb = await _settings_view(callback.from_user.id)
     await callback.message.edit_text(text, reply_markup=kb)
 
