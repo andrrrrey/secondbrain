@@ -7,6 +7,11 @@ allowed_ids: set[int] = set(settings.initial_allowed_ids)
 if settings.admin_user_id:
     allowed_ids.add(settings.admin_user_id)
 
+# Admin user IDs (modifiable at runtime). Главный админ из .env снять нельзя.
+admin_ids: set[int] = set()
+if settings.admin_user_id:
+    admin_ids.add(settings.admin_user_id)
+
 # Current OpenAI API key (modifiable at runtime) — эмбеддинги, Whisper, vision
 api_key: str = settings.openai_api_key
 
