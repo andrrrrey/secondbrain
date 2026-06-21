@@ -89,6 +89,7 @@ class AdminStates(StatesGroup):
     waiting_remove_user = State()
     waiting_api_key = State()
     waiting_routerai_key = State()
+    waiting_promote_user = State()
 
 
 # ── Pending voice/text storage ──────────────────────────────────
@@ -538,6 +539,11 @@ async def handle_text(message: Message, state: FSMContext) -> None:
     # If changing RouterAI API key
     if current == AdminStates.waiting_routerai_key.state:
         await _finish_routerai_key(message, state, text)
+        return
+
+    # If promoting a user to admin
+    if current == AdminStates.waiting_promote_user.state:
+        await _finish_promote_user(message, state, text)
         return
 
     _pending[message.from_user.id] = {"text": text, "note_type": NoteType.TEXT}
@@ -1294,7 +1300,7 @@ async def cb_sum_sethour(callback: CallbackQuery) -> None:
 # ═══════════════════════════════════════════════════════════════
 
 def _is_admin(user_id: int) -> bool:
-    return user_id == settings.admin_user_id
+    return user_id in rt.admin_ids
 
 
 def _mask_key(key: str) -> str:
@@ -1316,6 +1322,10 @@ def _admin_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📋 Список пользователей", callback_data="admin_list"),
         ],
         [
+            InlineKeyboardButton(text="👑 Назначить админа", callback_data="admin_promote"),
+            InlineKeyboardButton(text="🙍 Снять админа", callback_data="admin_demote"),
+        ],
+        [
             InlineKeyboardButton(text="🔑 Ключ OpenAI", callback_data="admin_key_openai"),
             InlineKeyboardButton(text="🔑 Ключ RouterAI", callback_data="admin_key_routerai"),
         ],
@@ -1332,10 +1342,10 @@ async def cmd_admin(message: Message, state: FSMContext) -> None:
         return
 
     await state.clear()
-    count = len(rt.allowed_ids)
     await message.answer(
         f"⚙️ Панель администратора\n\n"
-        f"Пользователей с доступом: {count}",
+        f"Пользователей с доступом: {len(rt.allowed_ids)}\n"
+        f"Администраторов: {len(rt.admin_ids)}",
         reply_markup=_admin_kb(),
     )
 
@@ -1352,7 +1362,12 @@ async def cb_admin_list(callback: CallbackQuery) -> None:
     else:
         lines = []
         for uid in sorted(rt.allowed_ids):
-            marker = " (admin)" if uid == settings.admin_user_id else ""
+            if uid == settings.admin_user_id:
+                marker = " 👑 (главный админ)"
+            elif uid in rt.admin_ids:
+                marker = " 👑 (админ)"
+            else:
+                marker = ""
             lines.append(f"• {uid}{marker}")
         text = "👥 Пользователи с доступом:\n\n" + "\n".join(lines)
 
@@ -1412,6 +1427,8 @@ async def cb_admin_rm(callback: CallbackQuery) -> None:
     await callback.answer()
     uid = int(callback.data.split(":")[1])
     rt.allowed_ids.discard(uid)
+    if uid != settings.admin_user_id:
+        rt.admin_ids.discard(uid)  # потерял доступ — снимаем и админку
 
     await callback.message.edit_text(
         f"✅ Пользователь {uid} удалён из списка доступа.",
@@ -1423,9 +1440,10 @@ async def cb_admin_rm(callback: CallbackQuery) -> None:
 async def cb_admin_cancel(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await callback.answer()
-    count = len(rt.allowed_ids)
     await callback.message.edit_text(
-        f"⚙️ Панель администратора\n\nПользователей с доступом: {count}",
+        f"⚙️ Панель администратора\n\n"
+        f"Пользователей с доступом: {len(rt.allowed_ids)}\n"
+        f"Администраторов: {len(rt.admin_ids)}",
         reply_markup=_admin_kb(),
     )
 
@@ -1445,6 +1463,95 @@ async def _finish_add_user(message: Message, state: FSMContext, text: str) -> No
     await state.clear()
     await message.answer(
         f"✅ Пользователь {uid} добавлен.",
+        reply_markup=_admin_kb(),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ADMIN: назначение / снятие администраторов
+# ═══════════════════════════════════════════════════════════════
+
+@router.callback_query(F.data == "admin_promote")
+async def cb_admin_promote(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа.")
+        return
+
+    await callback.answer()
+    await state.set_state(AdminStates.waiting_promote_user)
+    await callback.message.edit_text(
+        "👑 Отправь Telegram ID пользователя, которого назначить администратором:\n\n"
+        "(Узнать ID можно через @userinfobot)",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel")],
+        ]),
+    )
+
+
+async def _finish_promote_user(message: Message, state: FSMContext, text: str) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+
+    try:
+        uid = int(text)
+    except ValueError:
+        await message.answer("⚠️ Отправь числовой Telegram ID.")
+        return
+
+    rt.admin_ids.add(uid)
+    rt.allowed_ids.add(uid)  # админ обязан иметь доступ к боту
+    await state.clear()
+    await message.answer(
+        f"✅ Пользователь {uid} теперь администратор.\n\n"
+        "⚠️ Изменение действует до перезапуска бота (затем останется только админ из .env).",
+        reply_markup=_admin_kb(),
+    )
+
+
+@router.callback_query(F.data == "admin_demote")
+async def cb_admin_demote(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа.")
+        return
+
+    await callback.answer()
+    # Главного админа из .env снять нельзя
+    demotable = sorted(uid for uid in rt.admin_ids if uid != settings.admin_user_id)
+    if not demotable:
+        await callback.message.edit_text(
+            "Нет администраторов для снятия (главного админа снять нельзя).",
+            reply_markup=_admin_kb(),
+        )
+        return
+
+    buttons = [
+        [InlineKeyboardButton(text=f"🙍 {uid}", callback_data=f"admin_demote_do:{uid}")]
+        for uid in demotable
+    ]
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel")])
+    await callback.message.edit_text(
+        "Выбери, кого снять с администраторов:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@router.callback_query(F.data.startswith("admin_demote_do:"))
+async def cb_admin_demote_do(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа.")
+        return
+
+    await callback.answer()
+    uid = int(callback.data.split(":")[1])
+    if uid == settings.admin_user_id:
+        await callback.message.edit_text(
+            "Главного админа снять нельзя.", reply_markup=_admin_kb()
+        )
+        return
+
+    rt.admin_ids.discard(uid)
+    await callback.message.edit_text(
+        f"✅ Пользователь {uid} больше не администратор.",
         reply_markup=_admin_kb(),
     )
 
