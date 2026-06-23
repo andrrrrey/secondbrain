@@ -1312,7 +1312,20 @@ def _mask_key(key: str) -> str:
     return key[:8] + "…" + key[-4:]
 
 
+def _admin_panel_text() -> str:
+    access = "🌐 всем" if rt.open_access else "🔒 по списку"
+    return (
+        "⚙️ Панель администратора\n\n"
+        f"Доступ к боту: {access}\n"
+        f"Пользователей с доступом: {len(rt.allowed_ids)}\n"
+        f"Администраторов: {len(rt.admin_ids)}"
+    )
+
+
 def _admin_kb() -> InlineKeyboardMarkup:
+    access_label = (
+        "🔒 Закрыть доступ (по списку)" if rt.open_access else "🌐 Открыть доступ всем"
+    )
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="➕ Добавить пользователя", callback_data="admin_add"),
@@ -1320,6 +1333,9 @@ def _admin_kb() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="📋 Список пользователей", callback_data="admin_list"),
+        ],
+        [
+            InlineKeyboardButton(text=access_label, callback_data="admin_access_toggle"),
         ],
         [
             InlineKeyboardButton(text="👑 Назначить админа", callback_data="admin_promote"),
@@ -1342,12 +1358,7 @@ async def cmd_admin(message: Message, state: FSMContext) -> None:
         return
 
     await state.clear()
-    await message.answer(
-        f"⚙️ Панель администратора\n\n"
-        f"Пользователей с доступом: {len(rt.allowed_ids)}\n"
-        f"Администраторов: {len(rt.admin_ids)}",
-        reply_markup=_admin_kb(),
-    )
+    await message.answer(_admin_panel_text(), reply_markup=_admin_kb())
 
 
 @router.callback_query(F.data == "admin_list")
@@ -1372,6 +1383,19 @@ async def cb_admin_list(callback: CallbackQuery) -> None:
         text = "👥 Пользователи с доступом:\n\n" + "\n".join(lines)
 
     await callback.message.edit_text(text, reply_markup=_admin_kb())
+
+
+@router.callback_query(F.data == "admin_access_toggle")
+async def cb_admin_access_toggle(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа.")
+        return
+
+    rt.open_access = not rt.open_access
+    await callback.answer(
+        "Доступ открыт всем." if rt.open_access else "Доступ ограничен списком."
+    )
+    await callback.message.edit_text(_admin_panel_text(), reply_markup=_admin_kb())
 
 
 @router.callback_query(F.data == "admin_add")
@@ -1440,12 +1464,7 @@ async def cb_admin_rm(callback: CallbackQuery) -> None:
 async def cb_admin_cancel(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await callback.answer()
-    await callback.message.edit_text(
-        f"⚙️ Панель администратора\n\n"
-        f"Пользователей с доступом: {len(rt.allowed_ids)}\n"
-        f"Администраторов: {len(rt.admin_ids)}",
-        reply_markup=_admin_kb(),
-    )
+    await callback.message.edit_text(_admin_panel_text(), reply_markup=_admin_kb())
 
 
 # Handle user ID input for adding
