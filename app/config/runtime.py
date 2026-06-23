@@ -12,6 +12,9 @@ admin_ids: set[int] = set()
 if settings.admin_user_id:
     admin_ids.add(settings.admin_user_id)
 
+# Открытый доступ: если True — бот отвечает всем, белый список игнорируется.
+open_access: bool = False
+
 # Current OpenAI API key (modifiable at runtime) — эмбеддинги, Whisper, vision
 api_key: str = settings.openai_api_key
 
